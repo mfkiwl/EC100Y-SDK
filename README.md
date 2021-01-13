@@ -1,2 +1,0 @@
-# EC100Y-SDK
-QuecPython-EC100Y-SDK

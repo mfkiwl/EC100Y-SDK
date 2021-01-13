@@ -1,0 +1,384 @@
+# -*- coding: UTF-8 -*-
+'''
+硬件环境：EC600S
+软件环境：QuecPython
+'''
+import _thread
+import ujson
+import utime
+# import modem
+import sim
+import net
+import dataCall
+import audio
+# from misc import Power
+from aLiYun import aLiYun
+from machine import Pin
+from machine import ExtInt
+
+
+# MQTT CONNECT CONFIG
+clientId = "QuecPython_yunlaba"
+productKey = "a1A5W32fexl"
+# productSecret = "Trks8gtR82AUm2lX"
+productSecret = None
+deviceName = "yunlaba"
+deviceSecret = "b79eb8c46bc88f6e8f6559b572de7786"
+
+# MQTT CONNECT CONFIG END!
+
+# mqtt topic
+topic_conn_aliyun = "/a1A5W32fexl/yunlaba/user/ylb_conn_test"
+topic_trade_info = "/a1A5W32fexl/yunlaba/user/topic_trade_info"
+
+# 预置播报消息
+str_connect_network = ",正在连接网络,"
+str_connect_net_ok = ",网络连接成功,"
+str_connect_net_failed = ",网络连接失败,正在重新连接,"
+str_network_anomaly = ",移动网络异常,无法连接,"
+str_wait_connect = ",即将进入等待连接模式,"
+str_connect_server = ",正在连接服务器,"
+str_connect_server_ok = ",服务器连接成功,"
+str_connect_server_failed = ",服务器连接失败,正在重新连接,"
+str_dev_low_power = ",电量不足,请及时充电,"
+str_power_start = ",开始充电,"
+str_power_end = ",充电结束,"
+str_current_volume = ",音量{},"
+str_poweron = ",欢迎使用云喇叭智能语音设备,祝您生意兴隆,"
+str_poweroff = ",正在关机,"
+str_no_sim_card = ",请插入流量卡,并重启设备"
+
+tts = audio.TTS(0)
+# lock = _thread.allocate_lock()
+TTS_EN = Pin(Pin.GPIO10, Pin.OUT, Pin.PULL_PD, 1)
+net_led = Pin(Pin.GPIO9, Pin.OUT, Pin.PULL_DISABLE, 0)
+aliyun = aLiYun(productKey, productSecret, deviceName, deviceSecret)
+
+# 全局变量
+key_mode = 0  # 0-V+按键功能为音量调节，1-V+按键功能为查看交易历史记录，最多支持播报最近5条交易
+net_led_mode = 0
+run_mode = 0
+query_index = -1
+history_cnt = 0
+history_list = []
+
+
+def trade_info_history_list(info):
+    global query_index
+    global history_cnt
+    global history_list
+
+    query_index = -1
+    history_cnt += 1
+    if history_cnt > 5:
+        history_cnt = 5
+        history_list[4] = history_list[3]
+        history_list[3] = history_list[2]
+        history_list[2] = history_list[1]
+        history_list[1] = history_list[0]
+        history_list[0] = info
+    else:
+        history_list.insert(0, info)
+
+
+'''
+音量加
+'''
+def key_event_volume_up(args):
+    global run_mode
+    global key_mode
+    global query_index
+    global history_cnt
+    global history_list
+
+    if key_mode == 0:
+        vol = tts.getVolume()
+        if vol != 9:
+            vol = vol + 1
+            tts.setVolume(vol)
+        print('[++]current volume:{}'.format(vol))
+        if run_mode != 0:
+            tts.play(4, 1, 2, str_current_volume.format(vol))
+    elif key_mode == 1:
+        if history_cnt != 0:
+            query_index += 1
+            if query_index < history_cnt:
+                tts.play(3, 0, 2, history_list[query_index])
+            elif query_index >= history_cnt:
+                query_index = history_cnt - 1
+        else:
+            tts.play(3, 0, 2, "无历史记录")
+        print('history_list:{}'.format(history_list))
+
+
+'''
+音量减
+'''
+def key_event_volume_down(args):
+    global run_mode
+    global key_mode
+    global query_index
+    global history_cnt
+    global history_list
+
+    if key_mode == 0:
+        vol = tts.getVolume()
+        if vol != 0:
+            vol = vol - 1
+            tts.setVolume(vol)
+        print('[--]current volume:{}'.format(vol))
+        if run_mode != 0:
+            tts.play(4, 1, 2, str_current_volume.format(vol))
+    elif key_mode == 1:
+        if history_cnt != 0:
+            if query_index > 0:
+                query_index -= 1
+                tts.play(3, 0, 2, history_list[query_index])
+            elif query_index == 0:
+                query_index = -1
+        else:
+            tts.play(3, 0, 2, "无历史记录")
+        print('history_list:{}'.format(history_list))
+
+
+'''
+按键功能选择
+key_mode = 0，V+、V-用于音量调节
+key_mode = 1，V+、V-用于最近交易查询，最多支持查询最近5条记录
+'''
+def key_event_mode_select(args):
+    global key_mode
+    global query_index
+
+    if key_mode == 0:
+        key_mode = 1
+        tts.play(3, 0, 2, "查询历史模式")
+    elif key_mode == 1:
+        key_mode = 0
+        query_index = -1
+        tts.play(3, 0, 2, "音量调节模式")
+    print('[F]key mode:{}'.format(key_mode))
+
+
+
+def volume_key_event_handler():
+    vol_up = ExtInt(ExtInt.GPIO6, ExtInt.IRQ_FALLING, ExtInt.PULL_PU, key_event_volume_up)
+    vol_dw = ExtInt(ExtInt.GPIO8, ExtInt.IRQ_FALLING, ExtInt.PULL_PU, key_event_volume_down)
+    key_fun = ExtInt(ExtInt.GPIO7, ExtInt.IRQ_FALLING, ExtInt.PULL_PU, key_event_mode_select)
+    vol_up.enable()
+    vol_dw.enable()
+    key_fun.enable()
+
+
+'''
+网络状态指示灯控制任务
+网络正常，网络状态指示灯长亮
+网络异常，网络状态指示灯闪烁
+'''
+def net_status_led_control_task():
+    global net_led_mode
+    while True:
+        if net_led_mode == 0:
+            net_led.write(1)
+            utime.sleep_ms(500)
+        elif net_led_mode == 1:
+            net_led.write(1)
+            utime.sleep_ms(500)
+            net_led.write(0)
+            utime.sleep_ms(500)
+
+
+'''
+检测当前是否已拨号成功
+已拨号成功：返回1；否则返回0
+'''
+def check_data_call():
+    for pdp in range(1, 9):
+        nw_state = dataCall.getInfo(pdp, 0)
+        # print(nw_state)
+        if (nw_state != -1) and (nw_state[2][0] == 1):
+            print(nw_state)
+            return 1
+    return 0
+
+
+
+'''
+网络连接，如果连不上会一直在尝试连接,直到拨号联网成功才会退出该函数
+拨号成功：返回1；否则返回0
+'''
+def connnect_to_network():
+    nw_state = 0
+    try_count = 0
+    wait_mode = 0
+    global net_led_mode
+    sim_state = sim.getStatus()
+    if sim_state == 0:
+        tts.play(4, 0, 2, str_no_sim_card)
+        return 0
+    while nw_state == 0:
+        try_count += 1
+        if try_count > 1000:
+            try_count = 7
+
+        nw_state = dataCall.getInfo(1, 0)
+        print(nw_state)
+        if (nw_state != -1) and (nw_state[2][0] == 1):
+            wait_mode = 0
+            net_led_mode = 0
+            tts.play(4, 0, 2, str_connect_net_ok)
+            return 1
+        else:
+            if try_count == 6:
+                nw_state = 0
+                wait_mode = 1
+                tts.play(4, 0, 2, str_network_anomaly)
+                tts.play(4, 0, 2, str_wait_connect)
+            net_led_mode = 1
+            if wait_mode == 0:
+                tts.play(4, 0, 2, str_connect_network)
+
+            net_sta = net.getState()
+            if net_sta != -1 and net_sta[1][0] == 1:
+                ret = dataCall.start(1, 0, 'cmnet', '', '', 0)
+                if ret == 0:
+                    nw_state = dataCall.getInfo(1, 0)
+                    if (nw_state != -1) and (nw_state[2][0] == 1):
+                        wait_mode = 0
+                        tts.play(4, 0, 2, str_connect_net_ok)
+                        return 1
+                    else:
+                        nw_state = 0
+                        if wait_mode == 0:
+                            tts.play(4, 0, 2, str_connect_net_failed)
+                        utime.sleep(5)
+                else:
+                    nw_state = 0
+                    if wait_mode == 0:
+                        tts.play(4, 0, 2, str_connect_net_failed)
+                    utime.sleep(5)
+            else:
+                nw_state = 0
+                if wait_mode == 0:
+                    utime.sleep(10)
+                elif wait_mode == 1:
+                    utime.sleep(60)
+
+
+'''
+消息推送回调，接收到云端推送的msg时，会调用该函数
+'''
+def aliyun_mqtt_callback(topic, msg):
+    print('recv msg from topic: %s' % topic.decode())
+    print('msg : %s' % msg.decode())
+    global run_mode
+    global net_led_mode
+    if topic.decode() == topic_conn_aliyun:
+        if msg.decode() == 'connect aliyun succeed!':
+            run_mode = 1
+            net_led_mode = 0
+            tts.play(4, 0, 2, str_connect_server_ok)
+            # tts.play(4, 0, 2, str_connect_net_ok)
+        if msg.decode() == 'connect aliyun test':
+            run_mode = 1
+    if topic.decode() == topic_trade_info:
+        # 订单模板
+        # trade_info = {"orderID": 1,"productID": 11111111,"msg": "支付宝到账100元","PayStatus": 1,"createTime": "2020/10/31 13:45:52"}
+        tts_priority = 3
+        json_data = ujson.loads(msg)
+        tts_str = json_data.get('msg')
+        trade_info_history_list(tts_str)
+        ret = tts.play(tts_priority, 0, 2, tts_str)
+        if ret == -2:
+            tts_priority -= 1
+            if tts_priority == -1:
+                tts_priority = 3
+            tts.play(tts_priority, 0, 2, tts_str)
+
+
+'''
+定时检测与服务器连接状态
+'''
+def network_status_monitor():
+    global run_mode
+    global clientId
+    global net_led_mode
+    global str_connect_server
+    global topic_conn_aliyun
+    global topic_trade_info
+
+    while True:
+        if run_mode == 0:
+            print('connect to aliyun...')
+            print('network_status_monitor: running mode = 0')
+            tts.play(4, 0, 2, str_connect_server)
+            aliyun.setMqtt(clientId, clean_session=False, keepAlive=300)
+            aliyun.setCallback(aliyun_mqtt_callback)
+            print('subscribe topic: %s' % topic_conn_aliyun)
+            aliyun.subscribe(topic_conn_aliyun)
+            print('subscribe topic: %s' % topic_trade_info)
+            aliyun.subscribe(topic_trade_info, 1)
+            print('publish \'connect aliyun succeed!\' to aliyun')
+            aliyun.publish(topic_conn_aliyun, "connect aliyun succeed!")
+            aliyun.start()
+            run_mode = 2
+            utime.sleep(10)
+        elif run_mode == 1:
+            utime.sleep(50)
+            print('network_status_monitor: running mode = 1')
+            sta = tts.getState()
+            if sta == 0:
+                aliyun.publish(topic_conn_aliyun, "connect aliyun test")
+                run_mode = 2
+                utime.sleep(10)
+        elif run_mode == 2:
+            print('network_status_monitor: running mode = 2')
+            net_led_mode = 1
+            tts.play(4, 0, 2, "网络异常,正在重新连接")
+            net_sta = net.getState()
+            print(net_sta)
+            if net_sta != -1 and net_sta[1][0] == 1:
+                print('try datacall  11111')
+                ret = dataCall.start(1, 0, '3gnet', '', '', 0)
+                print('try datacall  22222')
+                if ret == 0:
+                    call_state = dataCall.getInfo(1, 0)
+                    if (call_state != -1) and (call_state[2][0] == 1):
+                        print('try datacall succeed!')
+                        print('aliyun.setMqtt 11111')
+                        aliyun.setMqtt(clientId, clean_session=False, keepAlive=300)
+                        print('aliyun.setMqtt 22222')
+                        aliyun.publish(topic_conn_aliyun, "connect aliyun succeed!")
+                elif ret == -1:
+                    print('try datacall failed!')
+            elif net_sta[1][0] == 0:
+                print('network disconnected!')
+            print('will sleep 60s')
+            utime.sleep(60)
+            print('sleep 60s end')
+
+
+'''
+检测充电状态，该函数需要单独放在一个线程中执行
+'''
+def check_charge_status():
+    pass
+
+
+if __name__ == '__main__':
+    utime.sleep(5)
+    _thread.start_new_thread(net_status_led_control_task, ())
+
+    tts.play(4, 0, 2, str_poweron)
+    print('connect to network...')
+    ret = connnect_to_network()
+    if ret == 0:
+        print('connect to network failed.')
+    else:
+        print('connect to network succeed.')
+        _thread.start_new_thread(network_status_monitor, ())
+        volume_key_event_handler()
+    while 1:
+        pass
+
+
